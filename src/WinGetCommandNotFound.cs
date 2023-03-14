@@ -1,19 +1,87 @@
-using Microsoft.Data.Sqlite;
 using System.Diagnostics;
-using System.IO;
 using System.Management.Automation;
 using System.Management.Automation.Runspaces;
 using System.Management.Automation.Subsystem;
 using System.Management.Automation.Subsystem.Feedback;
 using System.Management.Automation.Subsystem.Prediction;
-using System.Threading.Tasks;
+using System.Runtime.InteropServices;
+using Microsoft.Management.Deployment;
 
 namespace wingetprovider
 {
+    // Adapted from https://github.com/microsoft/winget-cli/blob/1898da0b657585d2e6399ef783ecb667eed280f9/src/PowerShell/Microsoft.WinGet.Client/Helpers/ComObjectFactory.cs
+    public class ComObjectFactory
+    {
+        private static readonly Guid PackageManagerClsid = Guid.Parse("C53A4F16-787E-42A4-B304-29EFFB4BF597");
+        private static readonly Guid FindPackagesOptionsClsid = Guid.Parse("572DED96-9C60-4526-8F92-EE7D91D38C1A");
+        private static readonly Guid PackageMatchFilterClsid = Guid.Parse("D02C9DAF-99DC-429C-B503-4E504E4AB000");
+
+        [System.Diagnostics.CodeAnalysis.SuppressMessage("Interoperability", "CA1416:Validate platform compatibility", Justification = "COM only usage.")]
+        private static readonly Type PackageManagerType = Type.GetTypeFromCLSID(PackageManagerClsid);
+
+        [System.Diagnostics.CodeAnalysis.SuppressMessage("Interoperability", "CA1416:Validate platform compatibility", Justification = "COM only usage.")]
+        private static readonly Type FindPackagesOptionsType = Type.GetTypeFromCLSID(FindPackagesOptionsClsid);
+
+        [System.Diagnostics.CodeAnalysis.SuppressMessage("Interoperability", "CA1416:Validate platform compatibility", Justification = "COM only usage.")]
+        private static readonly Type PackageMatchFilterType = Type.GetTypeFromCLSID(PackageMatchFilterClsid);
+
+        private static readonly Guid PackageManagerIid = Guid.Parse("B375E3B9-F2E0-5C93-87A7-B67497F7E593");
+        private static readonly Guid FindPackagesOptionsIid = Guid.Parse("A5270EDD-7DA7-57A3-BACE-F2593553561F");
+        private static readonly Guid PackageMatchFilterIid = Guid.Parse("D981ECA3-4DE5-5AD7-967A-698C7D60FC3B");
+
+        [System.Diagnostics.CodeAnalysis.SuppressMessage("Interoperability", "CA1416:Validate platform compatibility", Justification = "COM only usage.")]
+        private static T Create<T>(Type type, in Guid iid)
+        {
+            object instance = null;
+
+            // TODO CARLOS: Looks like we need a different activation path if we're running as admin
+            //if (Utilities.ExecutingAsAdministrator)
+            //{
+            //    int hr = WinGetServerManualActivation_CreateInstance(type.GUID, iid, 0, out instance);
+            //
+            //    if (hr < 0)
+            //    {
+            //        throw new COMException($"Failed to create instance: {hr}", hr);
+            //    }
+            //}
+            //else
+            //{
+            instance = Activator.CreateInstance(type);
+            //}
+
+            IntPtr pointer = Marshal.GetIUnknownForObject(instance);
+            return WinRT.MarshalInterface<T>.FromAbi(pointer);
+        }
+
+        [DllImport("winrtact.dll", EntryPoint = "WinGetServerManualActivation_CreateInstance", ExactSpelling = true, PreserveSig = true)]
+        private static extern int WinGetServerManualActivation_CreateInstance(
+                [In, MarshalAs(UnmanagedType.LPStruct)] Guid clsid,
+                [In, MarshalAs(UnmanagedType.LPStruct)] Guid iid,
+                uint flags,
+                [Out, MarshalAs(UnmanagedType.IUnknown)] out object instance);
+
+        [DllImport("winrtact.dll", EntryPoint = "winrtact_Initialize", ExactSpelling = true, PreserveSig = true)]
+        public static extern void InitializeUndockedRegFreeWinRT();
+
+        public static PackageManager CreatePackageManager()
+        {
+            return Create<PackageManager>(PackageManagerType, PackageManagerIid);
+        }
+
+        public static FindPackagesOptions CreateFindPackagesOptions()
+        {
+            return Create<FindPackagesOptions>(FindPackagesOptionsType, FindPackagesOptionsIid);
+        }
+
+        public static PackageMatchFilter CreatePackageMatchFilter()
+        {
+            return Create<PackageMatchFilter>(PackageMatchFilterType, PackageMatchFilterIid);
+        }
+    }
+
     public sealed class Init : IModuleAssemblyInitializer, IModuleAssemblyCleanup
     {
-        private const string feedbackId = "e5351aa4-dfde-4d4d-bf0f-1a2f5a37d8d6";
-        private const string predictorId = "b0fcf338-b1d8-43f6-bcb9-aadf697b9706";
+        internal const string id = "e5351aa4-dfde-4d4d-bf0f-1a2f5a37d8d6";
 
         public void OnImport()
         {
@@ -22,6 +90,7 @@ namespace wingetprovider
                 return;
             }
 
+            // Ensure WinGet is installed
             using (var rs = RunspaceFactory.CreateRunspace(InitialSessionState.CreateDefault()))
             {
                 rs.Open();
@@ -33,131 +102,144 @@ namespace wingetprovider
                 }
             }
 
-            // make sure latest index.db is loaded
-            var task = Task.Run(() => 
-            {
-                var psi = new ProcessStartInfo("winget", "source update --name winget");
-                psi.CreateNoWindow = true;
-                psi.RedirectStandardOutput = true;
-                psi.RedirectStandardError = true;
-                Process.Start(psi);
-            });
-
-            SubsystemManager.RegisterSubsystem<IFeedbackProvider, WinGetCommandNotFoundFeedback>(new WinGetCommandNotFoundFeedback(feedbackId));
-            SubsystemManager.RegisterSubsystem<ICommandPredictor, WinGetCommandNotFoundPredictor>(new WinGetCommandNotFoundPredictor(predictorId));
+            SubsystemManager.RegisterSubsystem<IFeedbackProvider, WinGetCommandNotFoundFeedbackPredictor>(WinGetCommandNotFoundFeedbackPredictor.Singleton);
+            SubsystemManager.RegisterSubsystem<ICommandPredictor, WinGetCommandNotFoundFeedbackPredictor>(WinGetCommandNotFoundFeedbackPredictor.Singleton);
         }
 
         public void OnRemove(PSModuleInfo psModuleInfo)
         {
-            SubsystemManager.UnregisterSubsystem<IFeedbackProvider>(new Guid(feedbackId));
-            SubsystemManager.UnregisterSubsystem<ICommandPredictor>(new Guid(predictorId));
+            SubsystemManager.UnregisterSubsystem<IFeedbackProvider>(new Guid(id));
+            SubsystemManager.UnregisterSubsystem<ICommandPredictor>(new Guid(id));
         }
     }
 
-    public sealed class WinGetCommandNotFoundFeedback : IFeedbackProvider
+    public sealed class WinGetCommandNotFoundFeedbackPredictor : IFeedbackProvider, ICommandPredictor
     {
         private readonly Guid _guid;
-        private SqliteConnection? _dbConnection;
+        private string? _suggestion;
+        private PackageManager _packageManager;
+        Dictionary<string, string>? ISubsystem.FunctionsToDefine => null;
 
-        public WinGetCommandNotFoundFeedback(string guid)
+        public static WinGetCommandNotFoundFeedbackPredictor Singleton { get; } = new WinGetCommandNotFoundFeedbackPredictor(Init.id);
+        private WinGetCommandNotFoundFeedbackPredictor(string guid)
         {
             _guid = new Guid(guid);
-            // Trying to enumerate WindowsApps folder results in AccessDenied,
-            // so using a hardcoded path for now
-            var dbPath = new FileInfo(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles) + @"\WindowsApps\Microsoft.Winget.Source_2023.309.1003.650_neutral__8wekyb3d8bbwe\Public\index.db");
-            if (!dbPath.Exists)
-            {
-                throw new Exception("Could not find index.db");
-            }
-
-            // open connection to index.db
-            _dbConnection = new SqliteConnection("Data Source=" + dbPath);
-            _dbConnection.Open();
+            ComObjectFactory.InitializeUndockedRegFreeWinRT();
+            _packageManager = ComObjectFactory.CreatePackageManager();
         }
 
         public void Dispose()
         {
-            _dbConnection?.Close();
-            _dbConnection?.Dispose();
         }
 
         public Guid Id => _guid;
 
-        public string Name => "winget-cmd-not-found";
+        public string Name => "Windows Package Manager - WinGet";
 
-        public string Description => "Finds missing commands that can be installed via winget.";
+        public string Description => "Finds missing commands that can be installed via WinGet.";
 
         /// <summary>
         /// Gets feedback based on the given commandline and error record.
         /// </summary>
-        public string? GetFeedback(string commandLine, ErrorRecord lastError, CancellationToken token)
+        public FeedbackItem? GetFeedback(string commandLine, ErrorRecord lastError, CancellationToken token)
         {
-            if (_dbConnection is not null && lastError.FullyQualifiedErrorId == "CommandNotFoundException")
+            if (lastError.FullyQualifiedErrorId == "CommandNotFoundException")
             {
                 var target = (string)lastError.TargetObject;
-                var command = _dbConnection.CreateCommand();
-                command.CommandText =
-                @"
-                    SELECT
-                        ids.id
-                    FROM
-                        commands, commands_map, manifest, ids
-                    WHERE
-                        commands.command = $command
-                        AND commands.rowid = commands_map.command
-                        AND manifest.rowid = commands_map.manifest
-                        AND ids.rowid = manifest.id
-                    LIMIT 1
-                ";
-                command.Parameters.AddWithValue("$command", target);
-
-                using (var reader = command.ExecuteReader())
+                var package = FindPackage(target);
+                if (package is null)
                 {
-                    while (reader.Read())
-                    {
-                        var suggestion = "winget install " + reader.GetString(0);
-                        WinGetCommandNotFoundPredictor.WingetPrediction = suggestion;
-                        return suggestion;
-                    }
+                    return null;
                 }
+                _suggestion = "winget install --id " + package.Id;
+                return new FeedbackItem(
+                    Name,
+                    new List<string> { _suggestion }
+                );
             }
-
             return null;
         }
-    }
 
-    public class WinGetCommandNotFoundPredictor : ICommandPredictor
-    {
-        private readonly Guid _guid;
-        internal static string? _wingetPrediction;
-        private static object _lock = new object();
-
-        internal static string? WingetPrediction
+        private CatalogPackage? TryGetBestMatchingPackage(IReadOnlyList<MatchResult> matches)
         {
-            get {
-                lock (_lock)
-                {
-                    return _wingetPrediction;
-                }
+            if (matches.Count == 1)
+            {
+                // One match --> return the package
+                return matches.First().CatalogPackage;
             }
-            set {
-                lock (_lock)
+            else if (matches.Count > 1)
+            {
+                // Multiple matches --> return the one with the shortest match that starts with the query
+                MatchResult? bestMatch = null;
+                for (int i = 0; i < matches.Count; i++)
                 {
-                    _wingetPrediction = value;
+                    var match = matches[i];
+                    if (match.MatchCriteria.Option == PackageFieldMatchOption.EqualsCaseInsensitive || match.MatchCriteria.Option == PackageFieldMatchOption.Equals)
+                    {
+                        // Exact match --> return the package
+                        return match.CatalogPackage;
+                    }
+                    else if (match.MatchCriteria.Option == PackageFieldMatchOption.StartsWithCaseInsensitive)
+                    {
+                        // get the shortest match that starts with the query
+                        if (bestMatch == null || match.MatchCriteria.Value.Length < bestMatch.MatchCriteria.Value.Length)
+                        {
+                            bestMatch = match;
+                        }
+                    }
                 }
+                // TODO CARLOS: bestMatch == null if only ContainsCaseInsensitive matches exist.
+                //   We should figure out a better way to handle this rather than just returning the first package.
+                return bestMatch == null ?
+                    matches.First().CatalogPackage :
+                    bestMatch.CatalogPackage;
             }
+            return null;
         }
 
-        public WinGetCommandNotFoundPredictor(string guid)
+        // Adapted from WinGet sample documentation: https://github.com/microsoft/winget-cli/blob/master/doc/specs/%23888%20-%20Com%20Api.md#32-search
+        private CatalogPackage? FindPackage(string query)
         {
-            _guid = new Guid(guid);
+            // Get the package catalog
+            var catalogRef = _packageManager.GetPredefinedPackageCatalog(PredefinedPackageCatalog.OpenWindowsCatalog);
+            var connectResult = catalogRef.Connect();
+            if (connectResult.Status != ConnectResultStatus.Ok)
+            {
+                // TODO CARLOS: do better if ConnectResultStatus != Ok (aka CatalogError)
+                return null;
+            }
+            var catalog = connectResult.PackageCatalog;
+
+            // Configure query for the package catalog
+            var findPackagesOptions = ComObjectFactory.CreateFindPackagesOptions();
+            var filter = ComObjectFactory.CreatePackageMatchFilter();
+            filter.Field = PackageMatchField.Command;
+            filter.Option = PackageFieldMatchOption.StartsWithCaseInsensitive;
+            filter.Value = query;
+            findPackagesOptions.Filters.Add(filter);
+
+            // Perform the query (search by command)
+            var findPackagesResult = catalog.FindPackages(findPackagesOptions);
+            var matches = findPackagesResult.Matches;
+            var pkg = TryGetBestMatchingPackage(matches);
+            if (pkg != null)
+            {
+                return pkg;
+            }
+
+            // No matches found when searching by command,
+            // let's try again and search by name
+            filter.Field = PackageMatchField.Name;
+            filter.Option = PackageFieldMatchOption.ContainsCaseInsensitive;
+            filter.Value = query;
+            findPackagesOptions.Filters.Clear();
+            findPackagesOptions.Filters.Add(filter);
+
+            // Perform the query (search by name)
+            findPackagesResult = catalog.FindPackages(findPackagesOptions);
+            matches = findPackagesResult.Matches;
+            return TryGetBestMatchingPackage(matches);
         }
-
-        public Guid Id => _guid;
-
-        public string Name => "winget-cmd-not-found-predictor";
-
-        public string Description => "Predict the install command for missing commands via winget.";
 
         public bool CanAcceptFeedback(PredictionClient client, PredictorFeedbackKind feedback)
         {
@@ -173,12 +255,12 @@ namespace wingetprovider
             List<PredictiveSuggestion>? result = null;
 
             result ??= new List<PredictiveSuggestion>(1);
-            if (WingetPrediction is null)
+            if (_suggestion is null)
             {
                 return default;
             }
 
-            result.Add(new PredictiveSuggestion(WingetPrediction));
+            result.Add(new PredictiveSuggestion(_suggestion));
 
             if (result is not null)
             {
@@ -190,7 +272,7 @@ namespace wingetprovider
 
         public void OnCommandLineAccepted(PredictionClient client, IReadOnlyList<string> history)
         {
-            WingetPrediction = null;
+            _suggestion = null;
         }
 
         public void OnSuggestionDisplayed(PredictionClient client, uint session, int countOrIndex) { }
