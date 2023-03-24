@@ -1,4 +1,4 @@
-using System.Diagnostics;
+using System.Security.Principal;
 using System.Management.Automation;
 using System.Management.Automation.Runspaces;
 using System.Management.Automation.Subsystem;
@@ -29,25 +29,29 @@ namespace wingetprovider
         private static readonly Guid FindPackagesOptionsIid = Guid.Parse("A5270EDD-7DA7-57A3-BACE-F2593553561F");
         private static readonly Guid PackageMatchFilterIid = Guid.Parse("D981ECA3-4DE5-5AD7-967A-698C7D60FC3B");
 
+        public static bool IsAdministrator()
+        {
+            WindowsIdentity identity = WindowsIdentity.GetCurrent();
+            WindowsPrincipal principal = new WindowsPrincipal(identity);
+            return principal.IsInRole(WindowsBuiltInRole.Administrator);
+        }
+
         [System.Diagnostics.CodeAnalysis.SuppressMessage("Interoperability", "CA1416:Validate platform compatibility", Justification = "COM only usage.")]
         private static T Create<T>(Type type, in Guid iid)
         {
             object instance = null;
-
-            // TODO CARLOS: Looks like we need a different activation path if we're running as admin
-            //if (Utilities.ExecutingAsAdministrator)
-            //{
-            //    int hr = WinGetServerManualActivation_CreateInstance(type.GUID, iid, 0, out instance);
-            //
-            //    if (hr < 0)
-            //    {
-            //        throw new COMException($"Failed to create instance: {hr}", hr);
-            //    }
-            //}
-            //else
-            //{
-            instance = Activator.CreateInstance(type);
-            //}
+            if (IsAdministrator())
+            {
+                var hr = WinGetServerManualActivation_CreateInstance(type.GUID, iid, 0, out instance);
+                if (hr < 0)
+                {
+                    throw new COMException($"Failed to create instance: {hr}", hr);
+                }
+            }
+            else
+            {
+                instance = Activator.CreateInstance(type);
+            }
 
             IntPtr pointer = Marshal.GetIUnknownForObject(instance);
             return WinRT.MarshalInterface<T>.FromAbi(pointer);
@@ -118,6 +122,8 @@ namespace wingetprovider
         private readonly Guid _guid;
         private string? _suggestion;
         private PackageManager _packageManager;
+        private FindPackagesOptions _findPackagesOptions;
+        private PackageMatchFilter _packageMatchFilter;
         Dictionary<string, string>? ISubsystem.FunctionsToDefine => null;
 
         public static WinGetCommandNotFoundFeedbackPredictor Singleton { get; } = new WinGetCommandNotFoundFeedbackPredictor(Init.id);
@@ -126,6 +132,8 @@ namespace wingetprovider
             _guid = new Guid(guid);
             ComObjectFactory.InitializeUndockedRegFreeWinRT();
             _packageManager = ComObjectFactory.CreatePackageManager();
+            _findPackagesOptions = ComObjectFactory.CreateFindPackagesOptions();
+            _packageMatchFilter = ComObjectFactory.CreatePackageMatchFilter();
         }
 
         public void Dispose()
@@ -146,7 +154,7 @@ namespace wingetprovider
             if (lastError.FullyQualifiedErrorId == "CommandNotFoundException")
             {
                 var target = (string)lastError.TargetObject;
-                var package = FindPackage(target);
+                var package = _FindPackage(target);
                 if (package is null)
                 {
                     return null;
@@ -160,7 +168,19 @@ namespace wingetprovider
             return null;
         }
 
-        private CatalogPackage? TryGetBestMatchingPackage(IReadOnlyList<MatchResult> matches)
+        private void _ApplyPackageMatchFilter(PackageMatchField field, PackageFieldMatchOption matchOption, string query)
+        {
+            // Configure filter
+            _packageMatchFilter.Field = field;
+            _packageMatchFilter.Option = matchOption;
+            _packageMatchFilter.Value = query;
+
+            // Apply filter
+            _findPackagesOptions.Filters.Clear();
+            _findPackagesOptions.Filters.Add(_packageMatchFilter);
+        }
+
+        private CatalogPackage? _TryGetBestMatchingPackage(IReadOnlyList<MatchResult> matches)
         {
             if (matches.Count == 1)
             {
@@ -188,40 +208,34 @@ namespace wingetprovider
                         }
                     }
                 }
-                // TODO CARLOS: bestMatch == null if only ContainsCaseInsensitive matches exist.
-                //   We should figure out a better way to handle this rather than just returning the first package.
+                // bestMatch is null iff only ContainsCaseInsensitive matches exist.
+                // There's no good way to figure out which one is relevant here, so just don't make a suggestion.
                 return bestMatch == null ?
-                    matches.First().CatalogPackage :
+                    null :
                     bestMatch.CatalogPackage;
             }
             return null;
         }
 
         // Adapted from WinGet sample documentation: https://github.com/microsoft/winget-cli/blob/master/doc/specs/%23888%20-%20Com%20Api.md#32-search
-        private CatalogPackage? FindPackage(string query)
+        private CatalogPackage? _FindPackage(string query)
         {
             // Get the package catalog
             var catalogRef = _packageManager.GetPredefinedPackageCatalog(PredefinedPackageCatalog.OpenWindowsCatalog);
             var connectResult = catalogRef.Connect();
-            if (connectResult.Status != ConnectResultStatus.Ok)
+            byte retryCount = 0;
+            while (connectResult.Status != ConnectResultStatus.Ok && retryCount < 3)
             {
-                // TODO CARLOS: do better if ConnectResultStatus != Ok (aka CatalogError)
-                return null;
+                connectResult = catalogRef.Connect();
+                retryCount++;
             }
             var catalog = connectResult.PackageCatalog;
 
-            // Configure query for the package catalog
-            var findPackagesOptions = ComObjectFactory.CreateFindPackagesOptions();
-            var filter = ComObjectFactory.CreatePackageMatchFilter();
-            filter.Field = PackageMatchField.Command;
-            filter.Option = PackageFieldMatchOption.StartsWithCaseInsensitive;
-            filter.Value = query;
-            findPackagesOptions.Filters.Add(filter);
-
             // Perform the query (search by command)
-            var findPackagesResult = catalog.FindPackages(findPackagesOptions);
+            _ApplyPackageMatchFilter(PackageMatchField.Command, PackageFieldMatchOption.StartsWithCaseInsensitive, query);
+            var findPackagesResult = catalog.FindPackages(_findPackagesOptions);
             var matches = findPackagesResult.Matches;
-            var pkg = TryGetBestMatchingPackage(matches);
+            var pkg = _TryGetBestMatchingPackage(matches);
             if (pkg != null)
             {
                 return pkg;
@@ -229,16 +243,12 @@ namespace wingetprovider
 
             // No matches found when searching by command,
             // let's try again and search by name
-            filter.Field = PackageMatchField.Name;
-            filter.Option = PackageFieldMatchOption.ContainsCaseInsensitive;
-            filter.Value = query;
-            findPackagesOptions.Filters.Clear();
-            findPackagesOptions.Filters.Add(filter);
+            _ApplyPackageMatchFilter(PackageMatchField.Name, PackageFieldMatchOption.ContainsCaseInsensitive, query);
 
             // Perform the query (search by name)
-            findPackagesResult = catalog.FindPackages(findPackagesOptions);
+            findPackagesResult = catalog.FindPackages(_findPackagesOptions);
             matches = findPackagesResult.Matches;
-            return TryGetBestMatchingPackage(matches);
+            return _TryGetBestMatchingPackage(matches);
         }
 
         public bool CanAcceptFeedback(PredictionClient client, PredictorFeedbackKind feedback)
