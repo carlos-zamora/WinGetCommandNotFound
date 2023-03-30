@@ -83,6 +83,31 @@ namespace wingetprovider
         }
     }
 
+    public sealed class WinGetComObjects
+    {
+        private static readonly WinGetComObjects instance = new WinGetComObjects();
+
+        private WinGetComObjects()
+        {
+            ComObjectFactory.InitializeUndockedRegFreeWinRT();
+            packageManager = ComObjectFactory.CreatePackageManager();
+            findPackagesOptions = ComObjectFactory.CreateFindPackagesOptions();
+            packageMatchFilter = ComObjectFactory.CreatePackageMatchFilter();
+        }
+        
+        public static WinGetComObjects Instance
+        {
+            get
+            {
+                return instance;
+            }
+        }
+
+        public PackageManager packageManager { get; }
+        public FindPackagesOptions findPackagesOptions { get; }
+        public PackageMatchFilter packageMatchFilter { get; }
+    }
+
     public sealed class Init : IModuleAssemblyInitializer, IModuleAssemblyCleanup
     {
         internal const string id = "e5351aa4-dfde-4d4d-bf0f-1a2f5a37d8d6";
@@ -118,9 +143,6 @@ namespace wingetprovider
     public sealed class WinGetCommandNotFoundFeedbackPredictor : IFeedbackProvider
     {
         private readonly Guid _guid;
-        private PackageManager _packageManager;
-        private FindPackagesOptions _findPackagesOptions;
-        private PackageMatchFilter _packageMatchFilter;
         private bool _tooManySuggestions;
 
         private static readonly byte _maxSuggestions = 5;
@@ -129,10 +151,6 @@ namespace wingetprovider
         private WinGetCommandNotFoundFeedbackPredictor(string guid)
         {
             _guid = new Guid(guid);
-            ComObjectFactory.InitializeUndockedRegFreeWinRT();
-            _packageManager = ComObjectFactory.CreatePackageManager();
-            _findPackagesOptions = ComObjectFactory.CreateFindPackagesOptions();
-            _packageMatchFilter = ComObjectFactory.CreatePackageMatchFilter();
             _tooManySuggestions = false;
         }
 
@@ -164,13 +182,13 @@ namespace wingetprovider
                 var suggestionList = new List<string>();
                 foreach (var pkg in pkgList)
                 {
-                    suggestionList.Add(String.Format("winget install --id {0} # Version: {1}", pkg.Id, pkg.DefaultInstallVersion.Version));
+                    suggestionList.Add(String.Format("winget install --id {0}", pkg.Id));
                 }
 
                 // Build footer message
-                var filterFieldString = _packageMatchFilter.Field == PackageMatchField.Command ? "command" : "name";
+                var filterFieldString = WinGetComObjects.Instance.packageMatchFilter.Field == PackageMatchField.Command ? "command" : "name";
                 var footerMessage = _tooManySuggestions ?
-                    String.Format("Additional results can be found using \"winget search --{0} {1}\"", filterFieldString, _packageMatchFilter.Value) :
+                    String.Format("Additional results can be found using \"winget search --{0} {1}\"", filterFieldString, WinGetComObjects.Instance.packageMatchFilter.Value) :
                     null;
 
                 return new FeedbackItem(
@@ -186,14 +204,14 @@ namespace wingetprovider
         private void _ApplyPackageMatchFilter(PackageMatchField field, PackageFieldMatchOption matchOption, string query)
         {
             // Configure filter
-            _packageMatchFilter.Field = field;
-            _packageMatchFilter.Option = matchOption;
-            _packageMatchFilter.Value = query;
+            WinGetComObjects.Instance.packageMatchFilter.Field = field;
+            WinGetComObjects.Instance.packageMatchFilter.Option = matchOption;
+            WinGetComObjects.Instance.packageMatchFilter.Value = query;
 
             // Apply filter
-            _findPackagesOptions.ResultLimit = _maxSuggestions + 1u;
-            _findPackagesOptions.Filters.Clear();
-            _findPackagesOptions.Filters.Add(_packageMatchFilter);
+            WinGetComObjects.Instance.findPackagesOptions.ResultLimit = _maxSuggestions + 1u;
+            WinGetComObjects.Instance.findPackagesOptions.Filters.Clear();
+            WinGetComObjects.Instance.findPackagesOptions.Filters.Add(WinGetComObjects.Instance.packageMatchFilter);
         }
 
         private List<CatalogPackage> _TryGetBestMatchingPackage(IReadOnlyList<MatchResult> matches)
@@ -260,7 +278,7 @@ namespace wingetprovider
         private List<CatalogPackage> _FindPackages(string query)
         {
             // Get the package catalog
-            var catalogRef = _packageManager.GetPredefinedPackageCatalog(PredefinedPackageCatalog.OpenWindowsCatalog);
+            var catalogRef = WinGetComObjects.Instance.packageManager.GetPredefinedPackageCatalog(PredefinedPackageCatalog.OpenWindowsCatalog);
             var connectResult = catalogRef.Connect();
             byte retryCount = 0;
             while (connectResult.Status != ConnectResultStatus.Ok && retryCount < 3)
@@ -272,7 +290,7 @@ namespace wingetprovider
 
             // Perform the query (search by command)
             _ApplyPackageMatchFilter(PackageMatchField.Command, PackageFieldMatchOption.StartsWithCaseInsensitive, query);
-            var findPackagesResult = catalog.FindPackages(_findPackagesOptions);
+            var findPackagesResult = catalog.FindPackages(WinGetComObjects.Instance.findPackagesOptions);
             var matches = findPackagesResult.Matches;
             var pkgList = _TryGetBestMatchingPackage(matches);
             if (pkgList.Count > 0)
@@ -285,7 +303,7 @@ namespace wingetprovider
             _ApplyPackageMatchFilter(PackageMatchField.Name, PackageFieldMatchOption.ContainsCaseInsensitive, query);
 
             // Perform the query (search by name)
-            findPackagesResult = catalog.FindPackages(_findPackagesOptions);
+            findPackagesResult = catalog.FindPackages(WinGetComObjects.Instance.findPackagesOptions);
             matches = findPackagesResult.Matches;
             return _TryGetBestMatchingPackage(matches);
         }
