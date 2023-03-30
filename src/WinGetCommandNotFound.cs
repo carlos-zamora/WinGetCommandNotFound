@@ -107,24 +107,23 @@ namespace wingetprovider
             }
 
             SubsystemManager.RegisterSubsystem<IFeedbackProvider, WinGetCommandNotFoundFeedbackPredictor>(WinGetCommandNotFoundFeedbackPredictor.Singleton);
-            SubsystemManager.RegisterSubsystem<ICommandPredictor, WinGetCommandNotFoundFeedbackPredictor>(WinGetCommandNotFoundFeedbackPredictor.Singleton);
         }
 
         public void OnRemove(PSModuleInfo psModuleInfo)
         {
             SubsystemManager.UnregisterSubsystem<IFeedbackProvider>(new Guid(id));
-            SubsystemManager.UnregisterSubsystem<ICommandPredictor>(new Guid(id));
         }
     }
 
-    public sealed class WinGetCommandNotFoundFeedbackPredictor : IFeedbackProvider, ICommandPredictor
+    public sealed class WinGetCommandNotFoundFeedbackPredictor : IFeedbackProvider
     {
         private readonly Guid _guid;
-        private string? _suggestion;
         private PackageManager _packageManager;
         private FindPackagesOptions _findPackagesOptions;
         private PackageMatchFilter _packageMatchFilter;
-        Dictionary<string, string>? ISubsystem.FunctionsToDefine => null;
+        private bool _tooManySuggestions;
+
+        private static readonly byte _maxSuggestions = 5;
 
         public static WinGetCommandNotFoundFeedbackPredictor Singleton { get; } = new WinGetCommandNotFoundFeedbackPredictor(Init.id);
         private WinGetCommandNotFoundFeedbackPredictor(string guid)
@@ -134,6 +133,7 @@ namespace wingetprovider
             _packageManager = ComObjectFactory.CreatePackageManager();
             _findPackagesOptions = ComObjectFactory.CreateFindPackagesOptions();
             _packageMatchFilter = ComObjectFactory.CreatePackageMatchFilter();
+            _tooManySuggestions = false;
         }
 
         public void Dispose()
@@ -154,15 +154,30 @@ namespace wingetprovider
             if (lastError.FullyQualifiedErrorId == "CommandNotFoundException")
             {
                 var target = (string)lastError.TargetObject;
-                var package = _FindPackage(target);
-                if (package is null)
+                var pkgList = _FindPackages(target);
+                if (pkgList.Count == 0)
                 {
                     return null;
                 }
-                _suggestion = "winget install --id " + package.Id;
+
+                // Build list of suggestions
+                var suggestionList = new List<string>();
+                foreach (var pkg in pkgList)
+                {
+                    suggestionList.Add(String.Format("winget install --id {0} # Version: {1}", pkg.Id, pkg.DefaultInstallVersion.Version));
+                }
+
+                // Build footer message
+                var filterFieldString = _packageMatchFilter.Field == PackageMatchField.Command ? "command" : "name";
+                var footerMessage = _tooManySuggestions ?
+                    String.Format("Additional results can be found using \"winget search --{0} {1}\"", filterFieldString, _packageMatchFilter.Value) :
+                    null;
+
                 return new FeedbackItem(
-                    Name,
-                    new List<string> { _suggestion }
+                    "Try installing this package using winget:",
+                    suggestionList,
+                    footerMessage,
+                    FeedbackDisplayLayout.Portrait
                 );
             }
             return null;
@@ -176,49 +191,73 @@ namespace wingetprovider
             _packageMatchFilter.Value = query;
 
             // Apply filter
+            _findPackagesOptions.ResultLimit = _maxSuggestions + 1u;
             _findPackagesOptions.Filters.Clear();
             _findPackagesOptions.Filters.Add(_packageMatchFilter);
         }
 
-        private CatalogPackage? _TryGetBestMatchingPackage(IReadOnlyList<MatchResult> matches)
+        private List<CatalogPackage> _TryGetBestMatchingPackage(IReadOnlyList<MatchResult> matches)
         {
+            var results = new List<CatalogPackage>();
             if (matches.Count == 1)
             {
                 // One match --> return the package
-                return matches.First().CatalogPackage;
+                results.Add(matches.First().CatalogPackage);
             }
             else if (matches.Count > 1)
             {
-                // Multiple matches --> return the one with the shortest match that starts with the query
-                MatchResult? bestMatch = null;
+                // Multiple matches --> display top 5 matches (prioritize best matches first)
+                var bestExactMatches = new List<CatalogPackage>();
+                var secondaryMatches = new List<CatalogPackage>();
+                var tertiaryMatches = new List<CatalogPackage>();
                 for (int i = 0; i < matches.Count; i++)
                 {
                     var match = matches[i];
-                    if (match.MatchCriteria.Option == PackageFieldMatchOption.EqualsCaseInsensitive || match.MatchCriteria.Option == PackageFieldMatchOption.Equals)
+                    switch (match.MatchCriteria.Option)
                     {
-                        // Exact match --> return the package
-                        return match.CatalogPackage;
-                    }
-                    else if (match.MatchCriteria.Option == PackageFieldMatchOption.StartsWithCaseInsensitive)
-                    {
-                        // get the shortest match that starts with the query
-                        if (bestMatch == null || match.MatchCriteria.Value.Length < bestMatch.MatchCriteria.Value.Length)
-                        {
-                            bestMatch = match;
-                        }
+                        case PackageFieldMatchOption.EqualsCaseInsensitive:
+                        case PackageFieldMatchOption.Equals:
+                            bestExactMatches.Add(match.CatalogPackage);
+                            break;
+                        case PackageFieldMatchOption.StartsWithCaseInsensitive:
+                            secondaryMatches.Add(match.CatalogPackage);
+                            break;
+                        case PackageFieldMatchOption.ContainsCaseInsensitive:
+                            tertiaryMatches.Add(match.CatalogPackage);
+                            break;
                     }
                 }
-                // bestMatch is null iff only ContainsCaseInsensitive matches exist.
-                // There's no good way to figure out which one is relevant here, so just don't make a suggestion.
-                return bestMatch == null ?
-                    null :
-                    bestMatch.CatalogPackage;
+
+                // Now return the top _maxSuggestions
+                while (results.Count < _maxSuggestions)
+                {
+                    if (bestExactMatches.Count > 0)
+                    {
+                        results.Add(bestExactMatches.First());
+                        bestExactMatches.RemoveAt(0);
+                    }
+                    else if (secondaryMatches.Count > 0)
+                    {
+                        results.Add(secondaryMatches.First());
+                        secondaryMatches.RemoveAt(0);
+                    }
+                    else if (tertiaryMatches.Count > 0)
+                    {
+                        results.Add(tertiaryMatches.First());
+                        tertiaryMatches.RemoveAt(0);
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
             }
-            return null;
+            _tooManySuggestions = matches.Count > _maxSuggestions;
+            return results;
         }
 
         // Adapted from WinGet sample documentation: https://github.com/microsoft/winget-cli/blob/master/doc/specs/%23888%20-%20Com%20Api.md#32-search
-        private CatalogPackage? _FindPackage(string query)
+        private List<CatalogPackage> _FindPackages(string query)
         {
             // Get the package catalog
             var catalogRef = _packageManager.GetPredefinedPackageCatalog(PredefinedPackageCatalog.OpenWindowsCatalog);
@@ -235,10 +274,10 @@ namespace wingetprovider
             _ApplyPackageMatchFilter(PackageMatchField.Command, PackageFieldMatchOption.StartsWithCaseInsensitive, query);
             var findPackagesResult = catalog.FindPackages(_findPackagesOptions);
             var matches = findPackagesResult.Matches;
-            var pkg = _TryGetBestMatchingPackage(matches);
-            if (pkg != null)
+            var pkgList = _TryGetBestMatchingPackage(matches);
+            if (pkgList.Count > 0)
             {
-                return pkg;
+                return pkgList;
             }
 
             // No matches found when searching by command,
@@ -250,45 +289,5 @@ namespace wingetprovider
             matches = findPackagesResult.Matches;
             return _TryGetBestMatchingPackage(matches);
         }
-
-        public bool CanAcceptFeedback(PredictionClient client, PredictorFeedbackKind feedback)
-        {
-            return feedback switch
-            {
-                PredictorFeedbackKind.CommandLineAccepted => true,
-                _ => false,
-            };
-        }
-
-        public SuggestionPackage GetSuggestion(PredictionClient client, PredictionContext context, CancellationToken cancellationToken)
-        {
-            List<PredictiveSuggestion>? result = null;
-
-            result ??= new List<PredictiveSuggestion>(1);
-            if (_suggestion is null)
-            {
-                return default;
-            }
-
-            result.Add(new PredictiveSuggestion(_suggestion));
-
-            if (result is not null)
-            {
-                return new SuggestionPackage(result);
-            }
-
-            return default;
-        }
-
-        public void OnCommandLineAccepted(PredictionClient client, IReadOnlyList<string> history)
-        {
-            _suggestion = null;
-        }
-
-        public void OnSuggestionDisplayed(PredictionClient client, uint session, int countOrIndex) { }
-
-        public void OnSuggestionAccepted(PredictionClient client, uint session, string acceptedSuggestion) { }
-
-        public void OnCommandLineExecuted(PredictionClient client, string commandLine, bool success) { }
     }
 }
