@@ -3,7 +3,6 @@
 	<PropertyGroup>
 		<TargetFramework>net8.0-windows10.0.22621.0</TargetFramework>
 		<Platform>AnyCPU</Platform>
-		<!--CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies-->
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
 		<GenerateDependencyFile>false</GenerateDependencyFile>
@@ -12,17 +11,9 @@
 		<RuntimeIdentifiers>win-arm64;win-x64</RuntimeIdentifiers>
 	</PropertyGroup>
 
-	<!-- From Directory.Build.props in CsWinRT sample -->
-	<!--<PropertyGroup>
-		<BuildOutDir>$([MSBuild]::NormalizeDirectory('$(SolutionDir)', '_build', '$(Platform)', '$(Configuration)'))</BuildOutDir>
-		<OutDir>$([MSBuild]::NormalizeDirectory('$(BuildOutDir)', '$(MSBuildProjectName)', 'bin'))</OutDir>
-		<IntDir>$([MSBuild]::NormalizeDirectory('$(BuildOutDir)', '$(MSBuildProjectName)', 'obj'))</IntDir>
-	</PropertyGroup>-->
-
 	<PropertyGroup>
 		<CsWinRTIncludes>Microsoft.Management.Deployment</CsWinRTIncludes>
 		<CsWinRTWindowsMetadata>10.0.22621.0</CsWinRTWindowsMetadata>
-		<!--<CsWinRTInputs>Microsoft.Management.Deployment.winmd</CsWinRTInputs>-->
 		<CsWinRTGeneratedFilesDir>$(OutDir)</CsWinRTGeneratedFilesDir>
 	</PropertyGroup>
 
